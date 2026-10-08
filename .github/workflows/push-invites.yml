@@ -29,9 +29,10 @@ jobs:
               for (const room of Object.keys(invites[uid] || {})) {
                 const inv = invites[uid][room] || {};
                 const key = uid + "_" + room;
-                if (sent[key] || !inv.at || now - inv.at > 20 * 60 * 1000) continue;
+                const at = inv.at || inv.t;
+                if (sent[key] || !at || now - at > 20 * 60 * 1000) continue;
                 const tok = (await db.ref("fcmTokens/" + uid).get()).val();
-                await db.ref("pushSent/" + key).set(inv.at);
+                await db.ref("pushSent/" + key).set(at);
                 if (!tok || !tok.token) continue;
                 try {
                   await admin.messaging().send({
