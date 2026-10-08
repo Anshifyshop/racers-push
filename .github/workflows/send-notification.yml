@@ -1,0 +1,60 @@
+name: Send notification to all
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: "Title"
+        required: true
+        default: "COME AND PLAY"
+      body:
+        description: "Message"
+        required: true
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: npm install firebase-admin@12
+      - name: Write script
+        run: |
+          cat > all.js <<'EOF'
+          const admin = require("firebase-admin");
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.SA)),
+            databaseURL: "https://the-real-racers-project-default-rtdb.asia-southeast1.firebasedatabase.app",
+          });
+          const db = admin.database();
+          (async () => {
+            const all = (await db.ref("fcmTokens").get()).val() || {};
+            const entries = Object.keys(all).filter(k => all[k] && all[k].token).map(k => ({ uid: k, token: all[k].token }));
+            console.log("players with token:", entries.length);
+            let ok = 0, bad = 0;
+            for (let i = 0; i < entries.length; i += 500) {
+              const chunk = entries.slice(i, i + 500);
+              const res = await admin.messaging().sendEachForMulticast({
+                tokens: chunk.map(e => e.token),
+                notification: { title: process.env.TITLE, body: process.env.BODY },
+                android: { priority: "high" },
+              });
+              for (let j = 0; j < res.responses.length; j++) {
+                const r = res.responses[j];
+                if (r.success) ok++;
+                else {
+                  bad++;
+                  if (r.error && r.error.code === "messaging/registration-token-not-registered") await db.ref("fcmTokens/" + chunk[j].uid).remove();
+                }
+              }
+            }
+            console.log("sent:", ok, "failed:", bad);
+            process.exit(0);
+          })().catch((e) => { console.error(e); process.exit(1); });
+          EOF
+      - name: Send
+        run: node all.js
+        env:
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          TITLE: ${{ inputs.title }}
+          BODY: ${{ inputs.body }}
