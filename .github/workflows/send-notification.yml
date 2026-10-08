@@ -1,4 +1,6 @@
 name: Send notification to all
+run-name: "Send ${{ inputs.tag || 'scheduled' }}"
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,7 +9,7 @@ on:
         required: true
         default: "COME AND PLAY"
       body:
-        description: "Message"
+        description: "Message (use {name} for the player's name)"
         required: true
       link:
         description: "Link (optional)"
@@ -17,6 +19,62 @@ on:
         description: "Image URL (optional)"
         required: false
         default: ""
+      target:
+        description: "Who gets it"
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - inactive
+          - new
+          - single
+      uid:
+        description: "Player UID (only for target = single)"
+        required: false
+        default: ""
+      topic:
+        description: "Topic (optional, only players opted in)"
+        required: false
+        default: ""
+      inactive_days:
+        description: "Days away (target = inactive)"
+        required: false
+        default: "3"
+      new_days:
+        description: "Joined within days (target = new)"
+        required: false
+        default: "2"
+      priority:
+        description: "high or normal"
+        required: false
+        type: choice
+        default: high
+        options:
+          - high
+          - normal
+      ttl_hours:
+        description: "Drop if phone offline for X hours (0 = default)"
+        required: false
+        default: "24"
+      delay_minutes:
+        description: "Wait X minutes before sending (max 330)"
+        required: false
+        default: "0"
+      dry_run:
+        description: "true = only count players, send nothing"
+        required: false
+        default: "false"
+      tag:
+        description: "Internal id (leave empty)"
+        required: false
+        default: ""
+
+  # DAILY AUTO MESSAGE (optional): remove the # on the next 2 lines.
+  # Time is UTC. Example: 14:00 UTC every day.
+  # schedule:
+  #   - cron: "0 14 * * *"
+
 jobs:
   send:
     runs-on: ubuntu-latest
@@ -24,49 +82,154 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - name: Install
         run: npm install firebase-admin@12
+
       - name: Write script
         run: |
           cat > all.js <<'EOF'
           const admin = require("firebase-admin");
-          admin.initializeApp({
-            credential: admin.credential.cert(JSON.parse(process.env.SA)),
-            databaseURL: "https://the-real-racers-project-default-rtdb.asia-southeast1.firebasedatabase.app",
-          });
-          const db = admin.database();
+          const fs = require("fs");
+          const E = process.env;
+
+          function clean(s) { return String(s).replace(/[\r\n%${}]/g, " ").slice(0, 160); }
+          function out(s) { if (E.GITHUB_OUTPUT) fs.appendFileSync(E.GITHUB_OUTPUT, "summary=" + s + "\n"); }
+          function fail(msg) { console.error("ERROR: " + msg); out("error=" + clean(msg)); process.exit(1); }
+
+          if (!E.SA) fail("Secret FIREBASE_SERVICE_ACCOUNT is missing. Add it in repo Settings > Secrets and variables > Actions.");
+          let cred;
+          try { cred = JSON.parse(E.SA); } catch (e) { fail("FIREBASE_SERVICE_ACCOUNT is not valid JSON. Paste the whole service account file."); }
+          try {
+            admin.initializeApp({
+              credential: admin.credential.cert(cred),
+              databaseURL: "https://the-real-racers-project-default-rtdb.asia-southeast1.firebasedatabase.app",
+            });
+          } catch (e) { fail("Firebase key rejected: " + e.message); }
+
+          function ts(v) {
+            if (!v) return 0;
+            if (typeof v === "number") return v;
+            const d = Date.parse(v);
+            return isNaN(d) ? 0 : d;
+          }
+          function fill(s, e) { return String(s).replace(/\{name\}/gi, e.name || e.playerName || "racer"); }
+
           (async () => {
+            const db = admin.database();
             const all = (await db.ref("fcmTokens").get()).val() || {};
-            const entries = Object.keys(all).filter(k => all[k] && all[k].token).map(k => ({ uid: k, token: all[k].token }));
-            console.log("players with token:", entries.length);
-            const notification = { title: process.env.TITLE, body: process.env.BODY };
-            if (process.env.IMAGE) notification.imageUrl = process.env.IMAGE;
-            const data = {};
-            if (process.env.LINK) data.link = process.env.LINK;
-            let ok = 0, bad = 0;
-            for (let i = 0; i < entries.length; i += 500) {
-              const chunk = entries.slice(i, i + 500);
-              const msg = { tokens: chunk.map(e => e.token), notification, android: { priority: "high" } };
-              if (Object.keys(data).length) msg.data = data;
-              const res = await admin.messaging().sendEachForMulticast(msg);
-              for (let j = 0; j < res.responses.length; j++) {
-                const r = res.responses[j];
-                if (r.success) ok++;
-                else {
-                  bad++;
-                  if (r.error && r.error.code === "messaging/registration-token-not-registered") await db.ref("fcmTokens/" + chunk[j].uid).remove();
+            let entries = Object.keys(all)
+              .filter(k => all[k] && all[k].token)
+              .map(k => Object.assign({ uid: k }, all[k]));
+            const total = entries.length;
+            console.log("players with token:", total);
+
+            const now = Date.now(), DAY = 86400000;
+            const target = E.TARGET || "all";
+            let skipped = 0;
+
+            if (target === "single") {
+              if (!E.UID) fail("Target is single but no UID was given.");
+              entries = entries.filter(e => e.uid === E.UID);
+              if (!entries.length) fail("No token found for UID " + E.UID + ". Open the game on that phone first.");
+            } else if (target === "inactive") {
+              const days = Number(E.INACTIVE_DAYS) || 3;
+              entries = entries.filter(e => {
+                const t = ts(e.lastSeen || e.updatedAt);
+                if (!t) { skipped++; return false; }
+                return now - t > days * DAY;
+              });
+            } else if (target === "new") {
+              const days = Number(E.NEW_DAYS) || 2;
+              entries = entries.filter(e => {
+                const t = ts(e.createdAt);
+                if (!t) { skipped++; return false; }
+                return now - t < days * DAY;
+              });
+            }
+
+            if (E.TOPIC) {
+              entries = entries.filter(e => {
+                const t = e.topics;
+                if (!t) return true;
+                if (Array.isArray(t)) return t.indexOf(E.TOPIC) >= 0;
+                return !!t[E.TOPIC];
+              });
+            }
+
+            console.log("target:", target, "-> audience:", entries.length, "skipped (no data):", skipped);
+
+            const dry = E.DRY_RUN === "true";
+            const ttlH = Number(E.TTL_HOURS) || 0;
+            let ok = 0, bad = 0, removed = 0;
+
+            if (!dry) {
+              for (let i = 0; i < entries.length; i += 500) {
+                const chunk = entries.slice(i, i + 500);
+                const msgs = chunk.map(e => {
+                  const notification = { title: fill(E.TITLE, e), body: fill(E.BODY, e) };
+                  if (E.IMAGE) notification.imageUrl = E.IMAGE;
+                  const android = { priority: E.PRIORITY === "normal" ? "normal" : "high" };
+                  if (ttlH > 0) android.ttl = ttlH * 3600 * 1000;
+                  const m = { token: e.token, notification: notification, android: android };
+                  if (E.LINK) m.data = { link: E.LINK };
+                  return m;
+                });
+                const res = await admin.messaging().sendEach(msgs);
+                for (let j = 0; j < res.responses.length; j++) {
+                  const r = res.responses[j];
+                  if (r.success) ok++;
+                  else {
+                    bad++;
+                    const code = r.error && r.error.code;
+                    if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
+                      await db.ref("fcmTokens/" + chunk[j].uid).remove();
+                      removed++;
+                    } else {
+                      console.log("failed:", chunk[j].uid, code);
+                    }
+                  }
                 }
               }
             }
-            console.log("sent:", ok, "failed:", bad);
+
+            console.log("sent:", ok, "failed:", bad, "removed:", removed);
+            out("targeted=" + entries.length + ";sent=" + ok + ";failed=" + bad + ";removed=" + removed +
+                ";total=" + total + ";skipped=" + skipped + ";dry=" + (dry ? 1 : 0));
             process.exit(0);
-          })().catch((e) => { console.error(e); process.exit(1); });
+          })().catch((e) => { fail(e.message || String(e)); });
           EOF
+
+      - name: Wait for scheduled time
+        if: ${{ inputs.delay_minutes != '' && inputs.delay_minutes != '0' }}
+        env:
+          DELAY: ${{ inputs.delay_minutes }}
+        run: |
+          case "$DELAY" in
+            ''|*[!0-9]*) echo "delay_minutes must be a number"; exit 1;;
+          esac
+          if [ "$DELAY" -gt 330 ]; then echo "delay too long (max 330 minutes)"; exit 1; fi
+          echo "Waiting $DELAY minutes..."
+          sleep $((DELAY * 60))
+
       - name: Send
+        id: send
         run: node all.js
         env:
           SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-          TITLE: ${{ inputs.title }}
-          BODY: ${{ inputs.body }}
+          TITLE: ${{ inputs.title || 'DAILY REWARD' }}
+          BODY: ${{ inputs.body || 'Your daily reward is ready. Collect it now!' }}
           LINK: ${{ inputs.link }}
           IMAGE: ${{ inputs.image }}
+          TARGET: ${{ inputs.target || 'all' }}
+          UID: ${{ inputs.uid }}
+          TOPIC: ${{ inputs.topic }}
+          INACTIVE_DAYS: ${{ inputs.inactive_days || '3' }}
+          NEW_DAYS: ${{ inputs.new_days || '2' }}
+          PRIORITY: ${{ inputs.priority || 'high' }}
+          TTL_HOURS: ${{ inputs.ttl_hours || '24' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+
+      - name: "RESULT ${{ steps.send.outputs.summary || 'no-output' }}"
+        if: always()
+        run: echo "done"
