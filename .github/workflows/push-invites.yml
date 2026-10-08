@@ -1,0 +1,59 @@
+name: Push invites
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: npm install firebase-admin@12
+      - name: Write script
+        run: |
+          cat > send.js <<'EOF'
+          const admin = require("firebase-admin");
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.SA)),
+            databaseURL: "https://the-real-racers-project-default-rtdb.asia-southeast1.firebasedatabase.app",
+          });
+          const db = admin.database();
+          (async () => {
+            const invites = (await db.ref("social/invites").get()).val() || {};
+            const sent = (await db.ref("pushSent").get()).val() || {};
+            const now = Date.now();
+            for (const uid of Object.keys(invites)) {
+              for (const room of Object.keys(invites[uid] || {})) {
+                const inv = invites[uid][room] || {};
+                const key = uid + "_" + room;
+                if (sent[key] || !inv.at || now - inv.at > 20 * 60 * 1000) continue;
+                const tok = (await db.ref("fcmTokens/" + uid).get()).val();
+                await db.ref("pushSent/" + key).set(inv.at);
+                if (!tok || !tok.token) continue;
+                try {
+                  await admin.messaging().send({
+                    token: tok.token,
+                    notification: {
+                      title: "COME AND PLAY",
+                      body: (inv.name || "A friend") + " invited you to a " + (inv.mode || "race") + " in THE REAL RACERS",
+                    },
+                    android: { priority: "high" },
+                  });
+                  console.log("sent", key);
+                } catch (e) {
+                  console.log("fail", key, e.code);
+                  if (e.code === "messaging/registration-token-not-registered") await db.ref("fcmTokens/" + uid).remove();
+                }
+              }
+            }
+            for (const k of Object.keys(sent)) if (now - sent[k] > 86400000) await db.ref("pushSent/" + k).remove();
+            process.exit(0);
+          })().catch((e) => { console.error(e); process.exit(1); });
+          EOF
+      - name: Run
+        run: node send.js
+        env:
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
