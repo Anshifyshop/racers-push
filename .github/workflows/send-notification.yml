@@ -9,6 +9,14 @@ on:
       body:
         description: "Message"
         required: true
+      link:
+        description: "Link (optional)"
+        required: false
+        default: ""
+      image:
+        description: "Image URL (optional)"
+        required: false
+        default: ""
 jobs:
   send:
     runs-on: ubuntu-latest
@@ -31,14 +39,16 @@ jobs:
             const all = (await db.ref("fcmTokens").get()).val() || {};
             const entries = Object.keys(all).filter(k => all[k] && all[k].token).map(k => ({ uid: k, token: all[k].token }));
             console.log("players with token:", entries.length);
+            const notification = { title: process.env.TITLE, body: process.env.BODY };
+            if (process.env.IMAGE) notification.imageUrl = process.env.IMAGE;
+            const data = {};
+            if (process.env.LINK) data.link = process.env.LINK;
             let ok = 0, bad = 0;
             for (let i = 0; i < entries.length; i += 500) {
               const chunk = entries.slice(i, i + 500);
-              const res = await admin.messaging().sendEachForMulticast({
-                tokens: chunk.map(e => e.token),
-                notification: { title: process.env.TITLE, body: process.env.BODY },
-                android: { priority: "high" },
-              });
+              const msg = { tokens: chunk.map(e => e.token), notification, android: { priority: "high" } };
+              if (Object.keys(data).length) msg.data = data;
+              const res = await admin.messaging().sendEachForMulticast(msg);
               for (let j = 0; j < res.responses.length; j++) {
                 const r = res.responses[j];
                 if (r.success) ok++;
@@ -58,3 +68,5 @@ jobs:
           SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           TITLE: ${{ inputs.title }}
           BODY: ${{ inputs.body }}
+          LINK: ${{ inputs.link }}
+          IMAGE: ${{ inputs.image }}
